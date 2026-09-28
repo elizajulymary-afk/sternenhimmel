@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sternenhimmel</title>
+<style>
+  :root {
+    --ink: #e9ecff;
+    --muted: #8b93c7;
+    --panel: rgba(14, 18, 44, 0.72);
+    --edge: rgba(160, 175, 255, 0.18);
+    --accent: #ffd98a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05060f; color: var(--ink);
+    font-family: "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; cursor: crosshair; touch-action: none; }
+
+  .hud { position: fixed; left: 16px; right: 16px; top: 16px; display: flex; gap: 12px;
+    justify-content: space-between; align-items: flex-start; pointer-events: none; }
+  .title { pointer-events: auto; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 12px; padding: 10px 14px; backdrop-filter: blur(6px); max-width: 320px; }
+  .title h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: .04em; }
+  .title p { margin: 4px 0 0; font-size: 12px; color: var(--muted); line-height: 1.4; }
+  .stats { font-size: 12px; color: var(--accent); margin-top: 6px; }
+
+  .tools { pointer-events: auto; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  button { background: var(--panel); color: var(--ink); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 8px 12px; font: inherit; font-size: 13px; cursor: pointer; backdrop-filter: blur(6px); }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  kbd { font-size: 10px; color: var(--muted); margin-left: 4px; }
+
+  .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 999px; padding: 8px 16px;
+    font-size: 13px; opacity: 0; transition: .3s; pointer-events: none; white-space: nowrap; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast b { color: var(--accent); font-weight: 600; }
+
+  @media (max-width: 600px) {
+    .hud { flex-direction: column; }
+    .tools { justify-content: flex-start; }
+    kbd { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+
+<div class="hud">
+  <div class="title">
+    <h1>✦ Sternenhimmel</h1>
+    <p>Klicke, um Sterne zu setzen. Sterne, die nah beieinander liegen, bilden Sternbilder. Das Mausrad ändert die Helligkeit.</p>
+    <div class="stats" id="stats">0 Sterne · 0 Sternbilder</div>
+  </div>
+  <div class="tools">
+    <button id="undo">Rückgängig<kbd>Z</kbd></button>
+    <button id="random">Zufallshimmel<kbd>R</kbd></button>
+    <button id="labels">Namen<kbd>N</kbd></button>
+    <button id="save">Als PNG<kbd>S</kbd></button>
+    <button id="clear">Leeren<kbd>C</kbd></button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const canvas = document.getElementById('sky');
+const ctx = canvas.getContext('2d');
+const LINK_RADIUS = 140;   // bis zu dieser Entfernung wird ein Stern angeschlossen
+const MERGE_RADIUS = 70;   // zwei Sternbilder verschmelzen nur, wenn man sehr nah setzt
+let W = 0, H = 0, DPR = 1;
+
+// ---------- Namen ----------
+const ROOTS = ['Vel', 'Cor', 'Lyr', 'Ser', 'Aqu', 'Dra', 'Pho', 'Can', 'Ori', 'Cas', 'Mer', 'Tha',
+  'Zeph', 'Ald', 'Bor', 'Nym', 'Sol', 'Lun', 'Vesp', 'Hyd', 'Cyg', 'Ech', 'Pyx', 'Nox'];
+const MIDS = ['a', 'e', 'i', 'o', 'u', 'ae', 'ia', 'or', 'an', 'el'];
+const ENDS = ['ris', 'nus', 'lia', 'tor', 'cus', 'dra', 'phis', 'ra', 'on', 'ella', 'ium', 'ax'];
+const EPITHETS = ['Minor', 'Major', 'Borealis', 'Australis', 'Obscura', 'Aurea', 'Silens', 'Errans', '', '', ''];
+const pick = a => a[Math.floor(Math.random() * a.length)];
+function makeName() {
+  const base = pick(ROOTS) + (Math.random() < 0.5 ? pick(MIDS) : '') + pick(ENDS);
+  const ep = pick(EPITHETS);
+  return ep ? `${base} ${ep}` : base;
+}
+
+// ---------- Zustand ----------
+// history: Liste gesetzter Sterne {x, y, mag, name}; alles andere wird daraus abgeleitet,
+// damit "Rückgängig" einfach den letzten Eintrag entfernt und neu aufbaut.
+let history = [];
+let stars = [], edges = [], groups = new Map();
+let showLabels = true;
+let magnitude = 1;       // Helligkeit des nächsten Sterns (0.5 – 2)
+let mouse = null;
+
+function rebuild() {
+  stars = []; edges = []; groups = new Map();
+  const parent = [];
+  const find = i => parent[i] === i ? i : (parent[i] = find(parent[i]));
+
+  history.forEach((h, i) => {
+    stars.push({ ...h, twinkle: Math.random() * Math.PI * 2 });
+    parent[i] = i;
+    // Nächsten Nachbarn finden und verbinden; zusätzlich den nächsten Stern eines
+    // anderen Sternbilds, damit sich Sternbilder zusammenschließen können.
+    const near = [];
+    for (let j = 0; j < i; j++) {
+      const d = Math.hypot(stars[j].x - h.x, stars[j].y - h.y);
+      if (d < LINK_RADIUS) near.push({ j, d });
+    }
+    near.sort((a, b) => a.d - b.d);
+    if (near.length === 0) {
+      groups.set(i, { name: h.name });
+      return;
+    }
+    const first = near[0].j;
+    edges.push([first, i]);
+    const rootA = find(first);
+    parent[i] = rootA;
+    const other = near.find(n => find(n.j) !== rootA && n.d < MERGE_RADIUS);
+    if (other) {
+      edges.push([other.j, i]);
+      const rootB = find(other.j);
+      const size = r => stars.filter((_, k) => find(k) === r).length;
+      const [keep, drop] = size(rootA) >= size(rootB) ? [rootA, rootB] : [rootB, rootA];
+      parent[drop] = keep;
+      parent[i] = keep;
+      groups.delete(drop);
+    }
+  });
+
+  // Mitglieder den Sternbildern zuordnen
+  for (const g of groups.values()) g.members = [];
+  stars.forEach((s, i) => {
+    const r = find(i);
+    s.group = r;
+    groups.get(r).members.push(s);
+  });
+
+  const named = [...groups.values()].filter(g => g.members.length >= 2).length;
+  document.getElementById('stats').textContent =
+    `${stars.length} Sterne · ${named} Sternbild${named === 1 ? '' : 'er'}`;
+}
+
+function addStar(x, y, silent = false) {
+  history.push({ x, y, mag: magnitude * (0.8 + Math.random() * 0.4), name: makeName() });
+  const before = new Set([...groups.values()].filter(g => g.members.length >= 2).map(g => g.name));
+  rebuild();
+  if (silent) return;
+  const s = stars[stars.length - 1];
+  const g = groups.get(s.group);
+  if (g.members.length === 2 && !before.has(g.name)) toast(`Neues Sternbild entdeckt: <b>${g.name}</b>`);
+  sparks.push({ x, y, t: 0 });
+}
+
+// ---------- Hintergrund ----------
+let dust = [];
+function makeDust() {
+  dust = Array.from({ length: Math.round(W * H / 2200) }, () => ({
+    x: Math.random() * W, y: Math.random() * H,
+    r: Math.random() * 0.9 + 0.2, a: Math.random() * 0.5 + 0.15, p: Math.random() * 6.28,
+  }));
+}
+let shooting = [];
+let sparks = [];
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  makeDust();
+}
+
+// ---------- Zeichnen ----------
+function drawStar(x, y, r, alpha) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r * 6);
+  g.addColorStop(0, `rgba(255, 244, 214, ${alpha})`);
+  g.addColorStop(0.15, `rgba(255, 220, 160, ${alpha * 0.6})`);
+  g.addColorStop(1, 'rgba(120, 140, 255, 0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r * 6, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+function frame(t) {
+  const time = t / 1000;
+  const bg = ctx.createRadialGradient(W * 0.5, H * 1.1, 0, W * 0.5, H * 0.5, Math.max(W, H));
+  bg.addColorStop(0, '#1a1840');
+  bg.addColorStop(0.5, '#0a0c24');
+  bg.addColorStop(1, '#04050d');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  for (const d of dust) {
+    ctx.globalAlpha = d.a * (0.6 + 0.4 * Math.sin(time * 1.3 + d.p));
+    ctx.fillStyle = '#cfd6ff';
+    ctx.fillRect(d.x, d.y, d.r, d.r);
+  }
+  ctx.globalAlpha = 1;
+
+  // Sternschnuppen
+  if (Math.random() < 0.004) {
+    shooting.push({ x: Math.random() * W, y: Math.random() * H * 0.5, vx: 7 + Math.random() * 5, vy: 3 + Math.random() * 2, life: 1 });
+  }
+  shooting = shooting.filter(s => s.life > 0);
+  for (const s of shooting) {
+    const grad = ctx.createLinearGradient(s.x, s.y, s.x - s.vx * 12, s.y - s.vy * 12);
+    grad.addColorStop(0, `rgba(255,255,255,${s.life})`);
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.strokeStyle = grad; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(s.x - s.vx * 12, s.y - s.vy * 12); ctx.stroke();
+    s.x += s.vx; s.y += s.vy; s.life -= 0.015;
+  }
+
+  // Verbindungslinien
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(160, 180, 255, 0.35)';
+  ctx.setLineDash([]);
+  for (const [a, b] of edges) {
+    ctx.beginPath(); ctx.moveTo(stars[a].x, stars[a].y); ctx.lineTo(stars[b].x, stars[b].y); ctx.stroke();
+  }
+
+  // Vorschau: welche Verbindung würde ein Klick erzeugen?
+  if (mouse) {
+    let best = null, bd = LINK_RADIUS;
+    for (const s of stars) {
+      const d = Math.hypot(s.x - mouse.x, s.y - mouse.y);
+      if (d < bd) { bd = d; best = s; }
+    }
+    if (best) {
+      ctx.setLineDash([4, 6]);
+      ctx.strokeStyle = 'rgba(255, 217, 138, 0.45)';
+      ctx.beginPath(); ctx.moveTo(best.x, best.y); ctx.lineTo(mouse.x, mouse.y); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    drawStar(mouse.x, mouse.y, 1.6 * magnitude, 0.35);
+  }
+
+  for (const s of stars) {
+    const tw = 0.75 + 0.25 * Math.sin(time * 2 + s.twinkle);
+    drawStar(s.x, s.y, 1.8 * s.mag, tw);
+  }
+
+  // Funken beim Setzen
+  sparks = sparks.filter(s => s.t < 1);
+  for (const s of sparks) {
+    ctx.strokeStyle = `rgba(255, 217, 138, ${1 - s.t})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 4 + s.t * 30, 0, Math.PI * 2); ctx.stroke();
+    s.t += 0.04;
+  }
+
+  if (showLabels) drawLabels();
+  requestAnimationFrame(frame);
+}
+
+function drawLabels() {
+  ctx.font = 'italic 13px Georgia, serif';
+  ctx.textAlign = 'center';
+  for (const g of groups.values()) {
+    if (g.members.length < 2) continue;
+    const cx = g.members.reduce((s, m) => s + m.x, 0) / g.members.length;
+    const maxY = Math.max(...g.members.map(m => m.y));
+    const y = Math.min(maxY + 28, H - 12);
+    ctx.fillStyle = 'rgba(255, 217, 138, 0.8)';
+    ctx.fillText(g.name, cx, y);
+  }
+}
+
+// ---------- Interaktion ----------
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+canvas.addEventListener('pointerdown', e => { const p = pos(e); addStar(p.x, p.y); });
+canvas.addEventListener('pointermove', e => { mouse = e.pointerType === 'mouse' ? pos(e) : null; });
+canvas.addEventListener('pointerleave', () => { mouse = null; });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  magnitude = Math.min(2, Math.max(0.5, magnitude - Math.sign(e.deltaY) * 0.1));
+  toast(`Helligkeit: <b>${Math.round(magnitude * 100)} %</b>`);
+}, { passive: false });
+
+function undo() { if (history.length) { history.pop(); rebuild(); } }
+function clearSky() { history = []; rebuild(); toast('Der Himmel ist wieder leer'); }
+function randomSky() {
+  history = [];
+  // Zentren mit Mindestabstand wählen, damit die Gruppen getrennt bleiben
+  const centers = [];
+  const gap = Math.max(170, Math.min(W, H) / 3.2);
+  for (let tries = 0; tries < 400 && centers.length < 7; tries++) {
+    const c = { x: 90 + Math.random() * (W - 180), y: 150 + Math.random() * (H - 250) };
+    if (centers.every(o => Math.hypot(o.x - c.x, o.y - c.y) > gap)) centers.push(c);
+  }
+  for (const c of centers) {
+    let { x, y } = c;
+    const n = 3 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < n; i++) {
+      magnitude = 0.6 + Math.random() * 1.2;
+      addStar(x, y, true);
+      const a = Math.random() * Math.PI * 2, d = 35 + Math.random() * 40;
+      x = Math.min(c.x + gap / 2.6, Math.max(c.x - gap / 2.6, x + Math.cos(a) * d));
+      y = Math.min(c.y + gap / 2.6, Math.max(c.y - gap / 2.6, y + Math.sin(a) * d));
+    }
+  }
+  magnitude = 1;
+  toast(`${[...groups.values()].filter(g => g.members.length >= 2).length} Sternbilder erschienen`);
+}
+function save() {
+  const prevMouse = mouse; mouse = null;
+  requestAnimationFrame(() => {
+    const a = document.createElement('a');
+    a.download = `sternenhimmel-${new Date().toISOString().slice(0, 10)}.png`;
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+    mouse = prevMouse;
+    toast('Bild gespeichert');
+  });
+}
+function toggleLabels() { showLabels = !showLabels; }
+
+document.getElementById('undo').onclick = undo;
+document.getElementById('clear').onclick = clearSky;
+document.getElementById('random').onclick = randomSky;
+document.getElementById('save').onclick = save;
+document.getElementById('labels').onclick = toggleLabels;
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'z') undo();
+  else if (k === 'c') clearSky();
+  else if (k === 'r') randomSky();
+  else if (k === 's') save();
+  else if (k === 'n') toggleLabels();
+});
+
+let toastTimer;
+function toast(html) {
+  const el = document.getElementById('toast');
+  el.innerHTML = html;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+}
+
+window.addEventListener('resize', resize);
+resize();
+rebuild();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
