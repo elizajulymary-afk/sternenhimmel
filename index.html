@@ -327,6 +327,8 @@ document.getElementById('random').onclick = randomSky;
 document.getElementById('save').onclick = save;
 document.getElementById('labels').onclick = toggleLabels;
 window.addEventListener('keydown', e => {
+  // Browser-Kürzel wie Strg+C, Strg+R oder Strg+S nicht abfangen
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   const k = e.key.toLowerCase();
   if (k === 'z') undo();
   else if (k === 'c') clearSky();
